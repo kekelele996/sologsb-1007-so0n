@@ -14,7 +14,16 @@ import {
 } from "solid-js";
 import { createSeedProject, uid } from "../data";
 import { downloadText, formatTime, loadProject, parseTime, saveProject } from "../persistence";
-import type { Confidence, PersistedEnvelope, ProjectData, Segment, TranscriptTrack } from "../types";
+import { buildRevisionSession, diffSentences, pendingRevisionCount } from "../revision";
+import type {
+  Confidence,
+  PersistedEnvelope,
+  ProjectData,
+  RevisionAddition,
+  RevisionProposal,
+  Segment,
+  TranscriptTrack,
+} from "../types";
 
 const CHANNEL_NAME = "sologsb-1007-editor";
 const TAB_ID = uid("tab");
@@ -114,7 +123,10 @@ export default function OralHistoryEditor() {
   const [helpOpen, setHelpOpen] = createSignal(false);
   const [commentDraft, setCommentDraft] = createSignal("");
   const [replyDrafts, setReplyDrafts] = createSignal<Record<string, string>>({});
-  const [trackFilter, setTrackFilter] = createSignal<"all" | "unreviewed" | "low">("all");
+  const [trackFilter, setTrackFilter] = createSignal<"all" | "unreviewed" | "low" | "pending">("all");
+  const [revisionOpen, setRevisionOpen] = createSignal(false);
+  const [revisionDraft, setRevisionDraft] = createSignal("");
+  const [inspectorTab, setInspectorTab] = createSignal("correct");
   let editorRef: HTMLTextAreaElement | undefined;
   let fileInputRef: HTMLInputElement | undefined;
   let saveTimer: number | undefined;
@@ -127,11 +139,33 @@ export default function OralHistoryEditor() {
     return data.tracks.find((track) => track.id === data.activeTrackId) ?? data.tracks[0];
   });
   const activeSegment = createMemo(() => activeTrack()?.segments.find((item) => item.id === selectedId()) ?? null);
+  const activeRevision = createMemo(() => activeTrack()?.revision);
+  const activePendingCount = createMemo(() => pendingRevisionCount(activeRevision()));
+  const trackPendingCount = (track: TranscriptTrack) => pendingRevisionCount(track.revision);
+  const pendingProposalBySegment = createMemo(() => {
+    const map = new Map<string, RevisionProposal>();
+    for (const proposal of activeRevision()?.proposals ?? []) {
+      if (proposal.status === "pending") map.set(proposal.segmentId, proposal);
+    }
+    return map;
+  });
   const visibleSegments = createMemo(() => {
     const segments = activeTrack()?.segments ?? [];
     if (trackFilter() === "unreviewed") return segments.filter((segment) => !segment.reviewed);
     if (trackFilter() === "low") return segments.filter((segment) => segment.confidence <= 2 || segment.flags.lowConfidence);
+    if (trackFilter() === "pending") return segments.filter((segment) => pendingProposalBySegment().has(segment.id));
     return segments;
+  });
+  const isAddition = (entry: Segment | RevisionAddition): entry is RevisionAddition => !("confidence" in entry);
+  const listEntries = createMemo<Array<Segment | RevisionAddition>>(() => {
+    const entries: Array<Segment | RevisionAddition> = [...visibleSegments()];
+    const additions = (activeRevision()?.additions ?? []).filter((addition) => addition.status === "pending");
+    for (const addition of additions) {
+      const index = entries.findIndex((entry) => entry.start > addition.start);
+      if (index === -1) entries.push(addition);
+      else entries.splice(index, 0, addition);
+    }
+    return entries;
   });
   const completedPercent = createMemo(() => {
     const segments = project().tracks.flatMap((track) => track.segments);
@@ -321,7 +355,117 @@ export default function OralHistoryEditor() {
     });
   };
 
+  const applyRevisionDraft = () => {
+    const text = revisionDraft().trim();
+    if (!text) return;
+    const incoming = parseTimedTranscript(text, "修订稿").segments;
+    if (!incoming.length) {
+      setLastAction("修订稿里未识别到带时间码的句子");
+      return;
+    }
+    commit("对照修订稿", (draft) => {
+      const track = draft.tracks.find((item) => item.id === draft.activeTrackId);
+      if (!track) return;
+      track.revision = buildRevisionSession(track, incoming, `审校修订稿 · ${new Date().toLocaleString()}`);
+    });
+    const session = activeRevision();
+    if (session) {
+      setLastAction(
+        `对照完成：保留 ${session.keptCount} 句 · 改写 ${session.proposals.length} 句 · 新增 ${session.additions.length} 句，待确认 ${pendingRevisionCount(session)} 处`,
+      );
+    }
+    setRevisionDraft("");
+    setRevisionOpen(false);
+    setTrackFilter("all");
+    setInspectorTab("revision");
+  };
+
+  const resolveProposal = (proposalId: string, accept: boolean) => {
+    commit(accept ? "采用修订句" : "保留原句", (draft) => {
+      const track = draft.tracks.find((item) => item.id === draft.activeTrackId);
+      const revision = track?.revision;
+      const proposal = revision?.proposals.find((item) => item.id === proposalId);
+      if (!track || !proposal || proposal.status !== "pending") return;
+      proposal.status = accept ? "accepted" : "kept";
+      if (accept) {
+        const segment = track.segments.find((item) => item.id === proposal.segmentId);
+        if (segment) {
+          segment.text = proposal.incomingText;
+          segment.start = proposal.incomingStart;
+          segment.end = proposal.incomingEnd;
+          segment.reviewed = false;
+        }
+      }
+    });
+  };
+
+  const resolveAddition = (additionId: string, accept: boolean) => {
+    commit(accept ? "采用新增句" : "忽略新增句", (draft) => {
+      const track = draft.tracks.find((item) => item.id === draft.activeTrackId);
+      const revision = track?.revision;
+      const addition = revision?.additions.find((item) => item.id === additionId);
+      if (!track || !addition || addition.status !== "pending") return;
+      addition.status = accept ? "accepted" : "dismissed";
+      if (accept) {
+        const neighbor = track.segments.filter((item) => item.start <= addition.start).at(-1) ?? track.segments[0];
+        const segment: Segment = {
+          id: uid("seg"),
+          start: addition.start,
+          end: addition.end,
+          speakerId: neighbor?.speakerId ?? addition.speakerId,
+          text: addition.text,
+          confidence: 3,
+          reviewed: false,
+          flags: { lowConfidence: false, dialect: false, properNoun: false },
+          tagIds: [],
+          comments: [],
+        };
+        const index = track.segments.findIndex((item) => item.start > addition.start);
+        if (index === -1) track.segments.push(segment);
+        else track.segments.splice(index, 0, segment);
+        setSelectedId(segment.id);
+      }
+    });
+  };
+
+  const clearRevision = () => {
+    commit("清除修订对照", (draft) => {
+      const track = draft.tracks.find((item) => item.id === draft.activeTrackId);
+      if (track) delete track.revision;
+    });
+  };
+
+  const jumpToNextPending = () => {
+    const track = activeTrack();
+    const revision = activeRevision();
+    if (!track || !revision) return;
+    const pendingIds = new Set(
+      revision.proposals.filter((item) => item.status === "pending").map((item) => item.segmentId),
+    );
+    const segments = track.segments;
+    const startIndex = Math.max(0, segments.findIndex((item) => item.id === selectedId()));
+    for (let offset = 1; offset <= segments.length; offset += 1) {
+      const segment = segments[(startIndex + offset) % segments.length];
+      if (pendingIds.has(segment.id)) {
+        setSelectedId(segment.id);
+        setInspectorTab("revision");
+        document.getElementById(`segment-${segment.id}`)?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+        return;
+      }
+    }
+    const addition = revision.additions.find((item) => item.status === "pending");
+    if (addition) {
+      setInspectorTab("revision");
+      document.getElementById(`addition-${addition.id}`)?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+  };
+
   const exportSrt = () => {
+    const pending = activePendingCount();
+    if (pending > 0) {
+      setLastAction(`还有 ${pending} 处修订待确认，全部处理完才能导出`);
+      return;
+    }
     const lines = activeTrack().segments.map((segment, index) => {
       const speaker = speakerById(segment.speakerId)?.name ?? "未知";
       return `${index + 1}\n${formatTime(segment.start)} --> ${formatTime(segment.end)}\n${speaker}：${segment.text}\n`;
@@ -490,7 +634,14 @@ export default function OralHistoryEditor() {
           <button class="icon-btn" title="撤销 Ctrl/Cmd+Z" disabled={!past().length} onClick={undo}>↶</button>
           <button class="icon-btn" title="重做 Ctrl/Cmd+Shift+Z" disabled={!future().length} onClick={redo}>↷</button>
           <button class="btn btn-quiet" onClick={() => setHelpOpen(true)}>快捷键 <kbd>?</kbd></button>
-          <button class="btn btn-primary" onClick={exportSrt}>导出 SRT</button>
+          <button
+            class="btn btn-primary export-btn"
+            title={activePendingCount() ? `还有 ${activePendingCount()} 处修订待确认，处理完才能导出` : "按当前轨道导出 SRT"}
+            onClick={exportSrt}
+          >
+            导出 SRT
+            <Show when={activePendingCount() > 0}><i class="export-badge">{activePendingCount()}</i></Show>
+          </button>
         </div>
       </header>
 
@@ -513,7 +664,13 @@ export default function OralHistoryEditor() {
                 {(track) => (
                   <button class={`track-card ${track.id === project().activeTrackId ? "active" : ""}`} onClick={() => switchTrack(track.id)}>
                     <span class="track-icon">{track.language === "English" ? "EN" : track.language === "福州话转写" ? "方" : "普"}</span>
-                    <span class="track-info"><strong>{track.name}</strong><small>{track.segments.length} 段 · {track.status}</small></span>
+                    <span class="track-info">
+                      <strong>{track.name}</strong>
+                      <small>
+                        {track.segments.length} 段 · {track.status}
+                        <Show when={trackPendingCount(track) > 0}> · <em class="track-pending">{trackPendingCount(track)} 处待确认</em></Show>
+                      </small>
+                    </span>
                     <span class="track-dot" style={{ background: track.status === "已完成" ? "#15803d" : track.status === "校对中" ? "#d97706" : "#94a3b8" }} />
                   </button>
                 )}
@@ -532,6 +689,8 @@ export default function OralHistoryEditor() {
             />
             <button class="wide-action" onClick={() => fileInputRef?.click()}><span>＋</span> 导入带时间码文本</button>
             <div class="hint">支持 SRT / VTT / 每行 `[00:12] 文本`</div>
+            <button class="wide-action" onClick={() => setRevisionOpen(true)}><span>⇪</span> 粘贴修订稿</button>
+            <div class="hint">与当前轨道按时间逐段对照，不新建轨道</div>
           </section>
 
           <section class="panel-section tag-summary">
@@ -555,45 +714,86 @@ export default function OralHistoryEditor() {
               <button class={trackFilter() === "all" ? "active" : ""} onClick={() => setTrackFilter("all")}>全部</button>
               <button class={trackFilter() === "unreviewed" ? "active" : ""} onClick={() => setTrackFilter("unreviewed")}>未校对</button>
               <button class={trackFilter() === "low" ? "active" : ""} onClick={() => setTrackFilter("low")}>低置信</button>
+              <button class={trackFilter() === "pending" ? "active" : ""} onClick={() => setTrackFilter("pending")}>
+                待确认{activePendingCount() ? ` ${activePendingCount()}` : ""}
+              </button>
             </div>
           </div>
 
+          <Show when={activeRevision()}>
+            {(revision) => (
+              <div class={`revision-banner ${activePendingCount() ? "" : "settled"}`}>
+                <div class="revision-summary">
+                  <strong>修订稿对照 · {revision().sourceName}</strong>
+                  <span>
+                    保留 {revision().keptCount} 句（沿用原校对状态与批注） · 改写 {revision().proposals.length} 句 · 新增 {revision().additions.length} 句
+                    {activePendingCount() ? `，还剩 ${activePendingCount()} 处待确认` : "，全部已确认"}
+                  </span>
+                </div>
+                <div class="revision-banner-actions">
+                  <button class="btn btn-quiet" disabled={!activePendingCount()} onClick={jumpToNextPending}>下一处待确认</button>
+                  <button class="btn btn-quiet" onClick={clearRevision}>清除对照</button>
+                </div>
+              </div>
+            )}
+          </Show>
+
           <div class="transcript-list" role="listbox" aria-label="转写片段">
-            <For each={visibleSegments()}>
-              {(segment, index) => (
-                <article
-                  id={`segment-${segment.id}`}
-                  role="option"
-                  aria-selected={segment.id === selectedId()}
-                  class={`segment-card ${segment.id === selectedId() ? "selected" : ""} ${segment.reviewed ? "reviewed" : ""}`}
-                  onClick={() => clickSegment(segment.id)}
-                >
-                  <div class="segment-rail" style={{ background: speakerById(segment.speakerId)?.color ?? "#64748b" }} />
+            <For each={listEntries()}>
+              {(entry) => isAddition(entry) ? (
+                <article id={`addition-${entry.id}`} class="segment-card addition-card">
+                  <div class="segment-rail" style={{ background: "#d97706" }} />
                   <div class="segment-time">
-                    <span>{formatTime(segment.start, false)}</span>
-                    <small>{formatTime(segment.end, false)}</small>
+                    <span>{formatTime(entry.start, false)}</span>
+                    <small>{formatTime(entry.end, false)}</small>
                   </div>
                   <div class="segment-body">
                     <div class="segment-meta">
-                      <b>{speakerById(segment.speakerId)?.name ?? "未知发言人"}</b>
-                      <span class={`confidence c${segment.confidence}`}>置信 {segment.confidence}/5</span>
-                      <Show when={segment.flags.lowConfidence}><span class="pill alert">低置信</span></Show>
-                      <Show when={segment.flags.dialect}><span class="pill dialect">方言</span></Show>
-                      <Show when={segment.flags.properNoun}><span class="pill proper">专名</span></Show>
-                      <Show when={segment.reviewed}><span class="pill done">✓ 已校对</span></Show>
+                      <b>修订稿新增</b>
+                      <span class="pill revision">新增待确认</span>
                     </div>
-                    <p>{segment.text}</p>
+                    <p>{entry.text}</p>
+                    <div class="addition-actions">
+                      <button onClick={() => resolveAddition(entry.id, true)}>采用新句</button>
+                      <button onClick={() => resolveAddition(entry.id, false)}>忽略</button>
+                    </div>
+                  </div>
+                </article>
+              ) : (
+                <article
+                  id={`segment-${entry.id}`}
+                  role="option"
+                  aria-selected={entry.id === selectedId()}
+                  class={`segment-card ${entry.id === selectedId() ? "selected" : ""} ${entry.reviewed ? "reviewed" : ""}`}
+                  onClick={() => clickSegment(entry.id)}
+                >
+                  <div class="segment-rail" style={{ background: speakerById(entry.speakerId)?.color ?? "#64748b" }} />
+                  <div class="segment-time">
+                    <span>{formatTime(entry.start, false)}</span>
+                    <small>{formatTime(entry.end, false)}</small>
+                  </div>
+                  <div class="segment-body">
+                    <div class="segment-meta">
+                      <b>{speakerById(entry.speakerId)?.name ?? "未知发言人"}</b>
+                      <span class={`confidence c${entry.confidence}`}>置信 {entry.confidence}/5</span>
+                      <Show when={entry.flags.lowConfidence}><span class="pill alert">低置信</span></Show>
+                      <Show when={entry.flags.dialect}><span class="pill dialect">方言</span></Show>
+                      <Show when={entry.flags.properNoun}><span class="pill proper">专名</span></Show>
+                      <Show when={entry.reviewed}><span class="pill done">✓ 已校对</span></Show>
+                      <Show when={pendingProposalBySegment().has(entry.id)}><span class="pill revision">修订待确认</span></Show>
+                    </div>
+                    <p>{entry.text}</p>
                     <div class="segment-tags">
-                      <For each={segment.tagIds.map(tagById).filter(Boolean)}>
+                      <For each={entry.tagIds.map(tagById).filter(Boolean)}>
                         {(tag) => <span style={{ "--tag-color": tag!.color } as any}>#{tag!.label}</span>}
                       </For>
                     </div>
                   </div>
-                  <span class="segment-index">{index() + 1}</span>
+                  <span class="segment-index">{activeTrack().segments.findIndex((item) => item.id === entry.id) + 1}</span>
                 </article>
               )}
             </For>
-            <Show when={!visibleSegments().length}>
+            <Show when={!listEntries().length}>
               <div class="empty-state"><b>没有符合筛选条件的片段</b><span>切换到“全部”继续校对。</span></div>
             </Show>
           </div>
@@ -602,11 +802,12 @@ export default function OralHistoryEditor() {
         <aside class="inspector">
           <Show when={activeSegment()} fallback={<div class="empty-inspector"><b>选择一个片段</b><p>在中间列表点击片段后即可校正发言人、置信度、标记和批注。</p></div>}>
             {(segment) => (
-              <Tabs defaultValue="correct" class="inspector-tabs">
+              <Tabs value={inspectorTab()} onChange={setInspectorTab} class="inspector-tabs">
                 <Tabs.List class="tab-list">
                   <Tabs.Trigger value="correct">校对</Tabs.Trigger>
                   <Tabs.Trigger value="annotate">标注</Tabs.Trigger>
                   <Tabs.Trigger value="comments">批注 <span>{segment().comments.length}</span></Tabs.Trigger>
+                  <Tabs.Trigger value="revision">修订 <Show when={activeRevision()}><span>{activePendingCount()}</span></Show></Tabs.Trigger>
                 </Tabs.List>
 
                 <Tabs.Content value="correct" class="tab-content">
@@ -714,6 +915,84 @@ export default function OralHistoryEditor() {
                     )}
                   </For>
                 </Tabs.Content>
+
+                <Tabs.Content value="revision" class="tab-content">
+                  <Show
+                    when={activeRevision()}
+                    fallback={<div class="mini-empty">当前轨道还没有修订对照。在左侧「粘贴修订稿」粘贴审校员回传的文本后，这里会逐句列出改写与新增。</div>}
+                  >
+                    {(revision) => (
+                      <>
+                        <div class="content-title">
+                          <h3>修订稿对照</h3>
+                          <p>
+                            {revision().sourceName}：保留 {revision().keptCount} 句沿用原校对状态与批注；以下改写与新增请逐句确认，采用后以修订稿的正文与时间码为准。
+                          </p>
+                        </div>
+                        <Show when={!revision().proposals.length && !revision().additions.length}>
+                          <div class="mini-empty">修订稿与当前轨道完全一致，没有需要确认的句子。</div>
+                        </Show>
+                        <For each={revision().proposals}>
+                          {(proposal) => {
+                            const diff = createMemo(() => diffSentences(proposal.originalText, proposal.incomingText));
+                            return (
+                              <article class={`revision-item ${proposal.status} ${proposal.segmentId === selectedId() ? "current" : ""}`}>
+                                <header>
+                                  <button
+                                    class="revision-time"
+                                    onClick={() => {
+                                      setSelectedId(proposal.segmentId);
+                                      document.getElementById(`segment-${proposal.segmentId}`)?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+                                    }}
+                                  >
+                                    {formatTime(proposal.incomingStart, false)} — {formatTime(proposal.incomingEnd, false)}
+                                  </button>
+                                  <span class={`pill ${proposal.status === "pending" ? "revision" : proposal.status === "accepted" ? "done" : "neutral"}`}>
+                                    {proposal.status === "pending" ? "改写待确认" : proposal.status === "accepted" ? "已采用新句" : "已保留原句"}
+                                  </span>
+                                </header>
+                                <p class="diff-line old">
+                                  <For each={diff().oldParts}>{(part) => <span class={part.changed ? "diff-del" : ""}>{part.text}</span>}</For>
+                                </p>
+                                <p class="diff-line new">
+                                  <For each={diff().newParts}>{(part) => <span class={part.changed ? "diff-ins" : ""}>{part.text}</span>}</For>
+                                </p>
+                                <Show when={proposal.status === "pending"}>
+                                  <div class="revision-actions">
+                                    <button class="accept" onClick={() => resolveProposal(proposal.id, true)}>采用新句</button>
+                                    <button class="keep" onClick={() => resolveProposal(proposal.id, false)}>保留原句</button>
+                                  </div>
+                                </Show>
+                              </article>
+                            );
+                          }}
+                        </For>
+                        <Show when={revision().additions.length > 0}>
+                          <div class="field-label">修订稿新增</div>
+                          <For each={revision().additions}>
+                            {(addition) => (
+                              <article class={`revision-item addition ${addition.status}`}>
+                                <header>
+                                  <span class="revision-time">{formatTime(addition.start, false)} — {formatTime(addition.end, false)}</span>
+                                  <span class={`pill ${addition.status === "pending" ? "revision" : addition.status === "accepted" ? "done" : "neutral"}`}>
+                                    {addition.status === "pending" ? "新增待确认" : addition.status === "accepted" ? "已采用" : "已忽略"}
+                                  </span>
+                                </header>
+                                <p class="diff-line new">{addition.text}</p>
+                                <Show when={addition.status === "pending"}>
+                                  <div class="revision-actions">
+                                    <button class="accept" onClick={() => resolveAddition(addition.id, true)}>采用新句</button>
+                                    <button class="keep" onClick={() => resolveAddition(addition.id, false)}>忽略</button>
+                                  </div>
+                                </Show>
+                              </article>
+                            )}
+                          </For>
+                        </Show>
+                      </>
+                    )}
+                  </Show>
+                </Tabs.Content>
               </Tabs>
             )}
           </Show>
@@ -743,6 +1022,32 @@ export default function OralHistoryEditor() {
               <span><kbd>?</kbd> 显示本帮助</span>
             </div>
             <div class="dialog-footer"><button class="btn btn-primary" onClick={() => setHelpOpen(false)}>开始校对</button></div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog>
+
+      <Dialog open={revisionOpen()} onOpenChange={setRevisionOpen}>
+        <Dialog.Portal>
+          <Dialog.Overlay class="dialog-overlay" />
+          <Dialog.Content class="dialog-content revision-dialog">
+            <Dialog.Title>粘贴修订稿</Dialog.Title>
+            <Dialog.Description>
+              把审校员回传的带时间码文本粘贴到下面，系统会按时间范围与当前轨道「{activeTrack().name}」逐段对照：没改动的句子沿用原校对状态与批注，改写与新增的句子逐句确认。
+            </Dialog.Description>
+            <textarea
+              class="revision-input"
+              rows="9"
+              placeholder={"00:00:07,200 --> 00:00:15,800\n阿婆，您还记得……\n\n或每行 [00:12] 文本"}
+              value={revisionDraft()}
+              onInput={(event) => setRevisionDraft(event.currentTarget.value)}
+            />
+            <Show when={activeRevision()}>
+              <p class="revision-warning">当前轨道已有一份对照结果（还剩 {activePendingCount()} 处待确认），重新对照会将其替换。</p>
+            </Show>
+            <div class="dialog-footer">
+              <button class="btn btn-quiet" onClick={() => setRevisionOpen(false)}>取消</button>
+              <button class="btn btn-primary" disabled={!revisionDraft().trim()} onClick={applyRevisionDraft}>开始对照</button>
+            </div>
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog>

@@ -47,12 +47,41 @@ export interface Segment {
   comments: ReviewComment[];
 }
 
+export interface RevisionProposal {
+  id: string;
+  segmentId: string;
+  originalText: string;
+  incomingText: string;
+  incomingStart: number;
+  incomingEnd: number;
+  status: "pending" | "accepted" | "kept";
+}
+
+export interface RevisionAddition {
+  id: string;
+  start: number;
+  end: number;
+  text: string;
+  speakerId: string;
+  status: "pending" | "accepted" | "dismissed";
+}
+
+export interface RevisionSession {
+  id: string;
+  sourceName: string;
+  createdAt: string;
+  keptCount: number;
+  proposals: RevisionProposal[];
+  additions: RevisionAddition[];
+}
+
 export interface TranscriptTrack {
   id: string;
   name: string;
   language: string;
   status: "待校对" | "校对中" | "已完成";
   segments: Segment[];
+  revision?: RevisionSession;
 }
 
 export interface ProjectData {
