@@ -47,12 +47,39 @@ export interface Segment {
   comments: ReviewComment[];
 }
 
+/** 改写/新增条目的逐句处置：待决定 / 采用审校回传的新句 / 保留原句（新增项也可不收入正稿）。 */
+export type RevisionDecision = "undecided" | "new" | "original";
+
+export type RevisionKind = "kept" | "changed" | "added";
+
+export interface RevisionItem {
+  id: string;
+  kind: RevisionKind;
+  /** 时间范围配对到的原片段；改写/保留时有值，新增时为 null。 */
+  originalId: string | null;
+  start: number;
+  end: number;
+  /** 审校回传的新句；保留项与原句完全一致。 */
+  revisedText: string;
+  /** 保留项固定沿用原句；改写/新增项初始 undecided，逐句决定后才不再计数。 */
+  decision: "kept" | RevisionDecision;
+}
+
+export interface TrackRevision {
+  id: string;
+  source: string;
+  importedAt: string;
+  items: RevisionItem[];
+}
+
 export interface TranscriptTrack {
   id: string;
   name: string;
   language: string;
   status: "待校对" | "校对中" | "已完成";
   segments: Segment[];
+  /** 正在逐句确认的审校修订稿；未决条目处理完并应用前不允许导出。 */
+  revision?: TrackRevision;
 }
 
 export interface ProjectData {
